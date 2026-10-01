@@ -1,0 +1,15 @@
+title: twili8t
+description: twili8t's blog
+author: twili8t
+url: "https://twili8.github.io"
+github_username: twili8
+twitter_username: twili8t
+
+theme: minima
+plugins:
+  - jekyll-feed
+  - jekyll-seo-tag
+
+permalink: /:year/:month/:day/:title.html
+show_excerpts: true
+exclude: [README.md, Gemfile, Gemfile.lock, vendor/, .bundle/]
