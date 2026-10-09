@@ -3,12 +3,12 @@ layout: post
 title: "iCloud locks on iOS 12"
 date: 2026-10-09 12:00:00 +0000
 ---
+What are iCloud locks, why should I care, how to remove them, is human nature materialistically dialectical?
 
-# iCloud locks on iOS 12
 ### Background
-- iCloud Activation Lock is the check that appears after an erase if Find My was on. It’s enforced in part by mobileactivationd, a launchd daemon that reports activation state as strings like "Unactivated", "Activated", and "FactoryActivated".
+- An iCloud Activation Lock is the check that appears after an iPhon gets erased with Find My enabled. It’s enforced in part by `mobileactivationd`, a `launchd` daemon that reports activation state as strings like "Unactivated", "Activated", and "FactoryActivated".
 - An IPSW is Apple’s firmware archive.
-- The jailbreak is checkra1n, which uses the checkm8 bootrom exploit for A7–A11 devices. It leaves SSH reachable.
+- The jailbreak is checkra1n, which uses the checkm8 bootrom exploit for A7-A11 devices. It leaves SSH reachable.
 
 I have an old iOS 12.5.8 iPhone 6 I gave to someone. When they returned it, they had forgotten their iCloud password, leaving me with a slight problem. Apple products have these locks on them, iCloud activation locks, which are triggered when you reset a phone without logging out of your iCloud account. In this article, we will look at how I can successfully bypass it and use my phone for its camera plus a few pictures I took!
 
