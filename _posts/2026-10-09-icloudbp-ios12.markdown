@@ -1,4 +1,10 @@
-# iCloud Bypass on iOS 12
+---
+layout: post
+title: "iCloud locks on iOS 12"
+date: 2026-10-09 12:00:00 +0000
+---
+
+# iCloud locks on iOS 12
 ### Background
 - iCloud Activation Lock is the check that appears after an erase if Find My was on. It’s enforced in part by mobileactivationd, a launchd daemon that reports activation state as strings like "Unactivated", "Activated", and "FactoryActivated".
 - An IPSW is Apple’s firmware archive.
@@ -8,7 +14,7 @@ I have an old iOS 12.5.8 iPhone 6 I gave to someone. When they returned it, they
 
 # App Bundles
 
-My first instinct was to look online for tools that already do the job. Some exist, but they’re all paid! 😞. A friend tossed me an app bundle, one of those sketchy commercial "remove iCloud activation lock" utilities that float around download sites. I downloaded it and started working.
+My first instinct was to look online for tools that already do the job. Reddit was not helpful in the slightest for once but some exist however they’re all paid! 😞. A friend tossed me an app bundle, one of those sketchy commercial "remove iCloud activation lock" utilities that float around download sites. I downloaded it and started working.
 
 > Mac apps are folders with a .app extension. The application’s entry binary is specified in the .app’s Contents/Info.plist’s CFBundleExecutable entry, which points to a Mach-O in Contents/MacOS/.
 
