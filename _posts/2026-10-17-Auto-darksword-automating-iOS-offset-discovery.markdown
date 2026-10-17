@@ -11,7 +11,7 @@ The exploit is fine but the hardcoded hex you wrote one year ago are not. And no
 staring at a kernel late at night trying to work out whether `so_usecount` moved
 by eight bytes or sixteen, with nothing to grep for.
 
-That is where I ended up, and it is why I wrote [`auto-darksword`]().
+That is where I ended up, and it is why I wrote [auto-darksword](https://github.com/twili8/auto-darksword). Go star it!
 
 ## The lab problem
 
