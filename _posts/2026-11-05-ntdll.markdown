@@ -1,0 +1,213 @@
+---
+layout: post
+title: "Becoming an ntdll wannabe for fun & profit"
+date: 2026-11-05 12:00:00 +0000
+---
+An analysis of Windows internls followed by the impact of pasteurisation on global milk consumption in the twentieth century
+
+LoadLibrary looks simple. But it is not!
+
+> What `LoadLibraryW` actually does, read out of `ntdll.dll`, and what a manual mapper has to copy to stop looking like a manual mapper and how an EDR can identify manual mapping!
+
+Scope note: unmanaged PEs only. The loader does not run managed or script payloads, so they are out of scope here too.
+This article accompanies the [Homer](https://github.com/twili8/homer) framework.
+
+## Foremost
+
+`LoadLibraryW` loads a DLL. That is the story. In reality it's... slightly more complicated with complex steps that can be witnessed to identify manual mapping and beacons.
+
+```
+kernelbase!LoadLibraryW
+	-> kernelbase!LoadLibraryExW
+	  -> ntdll!LdrLoadDll
+	       -> LdrpLoadDll
+	            -> LdrpPreprocessDllName
+	            -> LdrpLoadDllInternal
+```
+
+`LdrLoadDll` is thin: policy bits (`LdrpPolicyBits`), a packaged-DLL check, a `SameTebFlags & 0x2000` reentrancy rejection, then one call. Do not model your loader on it. Model it on the three functions below.
+
+### LdrpPreprocessDllName
+
+With the introduction of kernelbase in Windows 10, Microsoft introduces API sets to prevent monolithic DLLs that export thousand of functions. Read more [here](https://stackoverflow.com/questions/47529106/what-are-api-ms-win-lx-x-x-dll-umbrella-libraries) and [here](https://msdn.microsoft.com/en-us/library/windows/desktop/mt654040%28v=vs.85%29.aspx?f=255&MSPPError=-2147217396)! Redirecting API-set redirection happens in LdrpPreprocessDllName. The function calls `ApiSetpSearchForApiSet` and rewrites `api-ms-win-*` to the host DLL before any lookup.
+
+A mapper that matches import names literally against the PEB misses every descriptor that still names an API set.
+
+## LdrpLoadDllInternal
+
+`LdrpLoadDllInternal` does the work, in this order. Order matters and is observable:
+
+1. `LdrpFastpthReloadedDll`, fast path for a module mid-reload.
+2. `LdrpDrainWorkQueue(0)`,  wait for loader worker threads, unless `SameTebFlags & 0x1000`.
+3. `LdrpThreadTokenSetMainThreadToken`.
+4. `LdrpDetectDetour`, hotpatch / dot-local detection.
+5. `LdrpFindOrPrepareLoadingModule`.
+6. `LdrpDrainWorkQueue(1)`.
+7. `LdrpHandleReplacedModule`, `LdrpCondenseGraph`.
+8. `LdrpPrepareModuleForExecution`.
+9. `LdrpBuildForwarderLink`, `LdrpPinModule` when `LdrInitState == 0`.
+10. `LdrpFreeLoadContextOfNode`; on failure `LdrpDecrementModuleLoadCountEx` + `LdrpDereferenceModule`.
+
+Find, map, snap, init, notify!
+
+## The hash (almost) nobody checks
+
+When Windows looks for a DLL by name, it does not walk the PEB lists first for performance reasons. It hashes the name:
+
+```c
+h = 0;
+for each WCHAR c of the name:
+    h = 65599 * h + lowercase(c);   /* NLS-aware lowering */
+if (h == 0) h = 0x80000000;
+bucket = &LdrpHashTable[16 * (h & 0x1F)];
+```
+
+Then an exact `UNICODE_STRING` compare against `dte->BaseDllName`.
+
+Consequences:
+
+- Name lookup is hash-table first. The three PEB lists are bookkeeping, not the lookup path.
+- Because the bucket links the same `LDR_DATA_TABLE_ENTRY` node, patching that node in place (as Homer's unhook pass) is visible to name lookups without touching the bucket.
+- A mapper that fabricates its own LDR entry outside `LdrpHashTable` is invisible to `GetModuleHandle` and to the loader's own dedup, payloads are only able to parse the PEB to retrieve module handles.
+
+You can be loaded and still not exist, as far as name lookup is concerned.
+
+Missing from the table: `LdrpLoadKnownDll` -> `\KnownDlls\<name>`.
+
+## Mapping the image
+
+`LdrpMapDllWithSectionHandle` calls:
+
+* `LdrpMinimalMapModule` -> `NtCreateSection` + `NtMapViewOfSection` (`SEC_IMAGE`). For image sections the kernel applies base relocations when the view lands away from `ImageBase`, permissions are automatically applied per PE section so RX/RO sections have their memory protection bits set automatically by the kernel.
+* `LdrpCompleteMapModule`: `RtlImageNtHeaderEx`, `LdrpCorValidateImage` + `LdrpCorFixupImage` (CLR only), `LdrpRelocateImage`.
+* `LdrpAllocateModuleEntry`: `LDR_DATA_TABLE_ENTRY` from `LdrpHeap`, plus `BaseDllName` / `FullDllName` buffers, `TimeDateStamp`, `CheckSum`, `ServiceTag`.
+* `LdrpInsertDataTableEntry`: `InLoadOrder`, `InMemoryOrder`, `InInitializationOrder`.
+* `LdrpInsertModuleToIndexLockHeld`: three indexes, `LdrpHashTable[bucket]`, `LdrpMappingInfoIndex` (`RtlRbInsertNodeEx`, keyed by mapping info) and `LdrpModuleBaseAddressIndex` (`RtlRbInsertNodeEx`, keyed by `DllBase`).
+* `LdrpProcessMappedModule`, `LdrpCorProcessImports`, `LdrpLoadContextReplaceModule`.
+
+A raw-file mapper does the relocation itself; a `SEC_IMAGE` mapper does not. Don't mix the two (copying raw sections and expecting the kernel to relocate).
+
+## Imports: the step everyone skips
+
+### LdrpPrepareImportAddressTableForSnap
+
+This is the stage manual mappers almost always skip, and the reason is mundane: the IAT pages are copy-on-write, and changing their protection is not the same as committing them.
+
+1. `RtlImageDirectoryEntryToData(..., 12)` , the IAT directory, not the import directory.
+2. `ZwProtectVirtualMemory(PAGE_READWRITE)` over the IAT range.
+3. Touch one byte per 512-byte stride across the range, forcing the memory manager to commit each copy-on-write page before the first real write.
+4. Read `IMAGE_LOAD_CONFIG_DIRECTORY`: if `GuardFlags & 0x100` (CF instrumented) store `GuardCFCheckFunctionPointer` (load-config `+0x70`) and the dispatch pointer into the LDR entry.
+
+Skipping step 3 produces a first-write fault on a page the mapper believed was writable: the protect call changed protection, not commit state. A mapper that binds its imports while the view is still privately writable — as Homer does, copying raw sections before protections are set — never needs this, which is why it is listed under "not done" below rather than reimplemented.
+
+### LdrpSnapModule
+
+From `LdrpMapAndSnapDependency`.
+
+Loads each dependency (`LdrpLoadDependentModuleInternal`), resolves by name or ordinal, applies redirection (`LdrpCheckRedirection`, `CompatCachepLookupCdb`), then `LdrpDoPostSnapWork`.
+
+### Delay imports
+
+Not bound here. They stay unresolved until the module's own delay-load thunk runs on first call. Binding them at load time is safer than the real behaviour but is not equivalent; a payload that re-resolves its own delay imports will observe the difference.
+
+## Init: TLS first then DllMain
+
+`LdrpPrepareModuleForExecution`.
+
+`LdrpInitializeGraphRecurse` walks the dependency graph and calls `LdrpInitializeNode` per module in topological order.
+
+Per node:
+
+1. `LdrpAcquireLoaderLock`.
+2. `RtlActivateActivationContextUnsafeFast(dte->ActivationContext)`.
+3. TLS callbacks, if any: `LdrpCallTlsInitializers(1, dte)` — reason `DLL_PROCESS_ATTACH`, before `DllMain`.
+4. `LdrpCallInitRoutine(dte->DllMain, dte->DllBase, 1)` -> `LdrpCallInitRoutineInternal` -> `_guard_dispatch_icall` (CFG-checked indirect call), SEH-wrapped. Failure sets `Flags |= 0x100000` and returns `STATUS_DLL_INIT_FAILED`.
+5. `RtlDeactivateActivationContextUnsafeFast`, `Flags |= 0x80000`, `LdrpLogDllState`.
+
+Then `LdrpSendPostSnapNotifications` delivers `LdrRegisterDllNotification` callbacks.
+
+ETW (`LdrpLogEtwEvent`, `LdrpLogInternal`, `LdrpLogDllState`) is emitted throughout.
+
+TLS before `DllMain`. Get that backwards and you get init-order bugs and TLS that was never initialised.
+
+## What you lose if you skip it
+
+| ntdll behaviour | Skip it and you get |
+|---|---|
+| Hash insert (`65599*h+lower(c)`, `& 0x1F`) | `GetModuleHandle` by name misses |
+| `LdrpModuleBaseAddressIndex` | `LdrpFindEntryForAddress`, `GetModuleHandleEx(FROM_ADDRESS)` miss |
+| `LdrpMappingInfoIndex` | mapping-info lookups, hotpatch, `RtlPcToFileHeader` variants miss |
+| IAT prepare + COW touch | first IAT write faults on an uncommitted page |
+| LoadConfig / CFG registration | `_guard_dispatch_icall` rejects the module's pointers |
+| TLS callbacks before `DllMain`, dependency order | init-order bugs, TLS not initialised |
+| Activation context | manifest-dependent DLLs misbehave |
+| `LdrpSendPostSnapNotifications` | DLL notifications never fire |
+| Refcount + `LdrpPinModule` | unload destroys a live module |
+| Delay imports deferred | early binding changes observable behaviour |
+
+## What Homer actually does
+
+The goal is plausibility, not byte-for-byte emulation of the loader. Two things make a manually mapped image look like a load, everything else in this document is background:
+
+### PEB registration
+
+A mapped payload is otherwise invisible: `EnumProcessModules`, `GetModuleFileName`, PEB walkers and most scanners report the process as never having loaded it.
+
+Homer builds a zeroed, full-size `LDR_DATA_TABLE_ENTRY` and links it into `InLoadOrderModuleList` and `InMemoryOrderModuleList` under `LdrLockLoaderLock`. Fields set: `DllBase`, `EntryPoint`, `SizeOfImage`, `BaseDllName` and `FullDllName` (the export directory's own name, or a plausible default), `Flags = LDRP_ENTRY_INSERTED`, `LoadCount = 1`.
+
+`LDRP_PROCESS_ATTACH_CALLED` is deliberately left clear: ntdll only runs `DllMain(DLL_PROCESS_DETACH)` for entries carrying it, and Homer unlinks the entry before unmapping the image, so no list walk ever meets a dangling node.
+
+Without the entry, any list-walker — EnumProcessModules, PEB walkers in EDRs, most memory scanners' first pass — sees executable committed memory with no owning module. That is the textbook signature of shellcode or an injection. The entry converts "unbacked RX region" into "a loaded module" for every check that stops at the lists, which is most of them.
+Build switch: `-DHOMER_REGISTER_MODULE=0`.
+
+### Import-name scrub (`loader/scrub.c`)
+
+After the loader binds imports, the mapped image's import tables still contain the plaintext hint/name strings and DLL names for every API the payload uses, VirtualAlloc, CreateThread, NtCreateThreadEx... A memory scanner just reads the payload's shopping list straight out of its own IAT metadata. scrub.c zeroes those strings in the mapped copy once binding is done.
+
+## Detecting the unhook: the adversary's view
+
+Homer's unhook (`passes/unhook.c`) never writes to the instrumented image, never calls `LoadLibrary`, creates no threads and writes no files: it opens `\KnownDlls\<name>` (shared section, no disk I/O), falling back to a `SEC_IMAGE` mapping of the already-loaded file, binds the fresh image's imports, and repoints `DllBase`, `EntryPoint`, `SizeOfImage`, `OriginalBase` and `ParentDllBase` in the existing LDR entry across the three legacy lists. Here is what that does and does not emit, from the defender's chair.
+
+What the defender does *not* get:
+
+- **No protection transition on the hooked image.** Classic unhooking rewrites `.text` in place, which means a writable-then-executable transition on an image the EDR instrumented — the single loudest unhook tripwire. Homer's target pages are never made writable; the fresh image arrives already executable from the section mapping.
+- **No image-load telemetry for the clean copy.** Because nothing goes through the loader (`LoadLibrary`, loader lock, `Ldrp` notifications), no `LdrRegisterDllNotification` callback fires and no ETW ImageLoad event is emitted for the fresh mapping.
+- **No fabricated entry.** The patched node is the process's own `LDR_DATA_TABLE_ENTRY`, so `LoadCount`, `Flags`, TLS index and hash-table membership all stay intact. Fabricated-entry heuristics (zero refcount, entry invisible to `GetModuleHandle`) do not fire — name lookups keep resolving through the untouched `LdrpHashTable` bucket, which points at the same node.
+- **No inconsistent fields.** All five patched fields come from the fresh image's own headers (`OriginalBase` is its `ImageBase`, `ParentDllBase` is cleared), and the offsets are version-gated, so a field-level forensics check finds a self-consistent entry.
+- **No new imports or strings.** API resolution is PEB-walked with stack-built names; the pass adds no import-table entries and no DLL-name literals.
+
+What an offline analyst *can* still find — the design goal is defeating realtime tripwires, not memory forensics:
+
+- **Two mappings, one name.** A VAD walk shows `ntdll.dll` (or whichever target) mapped twice: the original and the fresh copy. The content is Microsoft-signed bytes from `\KnownDlls`, so it reads as anomaly, not malware, but it is visible.
+- **A DllBase with no load event.** ETW timeline analysis finds the current `DllBase` has no corresponding ImageLoad event; the original load event references the old base.
+- **Index divergence.** `LdrpModuleBaseAddressIndex` and `LdrpMappingInfoIndex` still reference the old mapping. Anything comparing the LDR `DllBase` against the RB-tree indexes or the backing section object sees the split — this is also why the disk-fallback mapping (fresh `SEC_IMAGE` section instead of the shared KnownDlls one) is the more exposed configuration.
+- **A GetProcAddress/IAT split.** IATs bound before the remap still point at hooked code; PEB-walk resolutions after it return clean addresses. Comparing the two reveals the split — and also explains why the host keeps working: pre-existing bindings are untouched, only post-remap resolutions (the payload's) take clean paths.
+
+In short: a live EDR watching for writes, loads, thread creation and loader-lock activity sees nothing; an analyst dumping VADs and ETW timelines afterwards sees everything, and what they find is signed Microsoft code at an unexpected base.
+
+## What Homer does not do
+
+| Not done | Why |
+|---|---|
+| `LdrpHashTable` insertion | Not exported; needs PDB offsets or a `.data` pattern scan, both of which break across Windows builds. Name lookups (`GetModuleHandle`) therefore still miss the payload. |
+| `LdrpModuleBaseAddressIndex`, `LdrpMappingInfoIndex` | Same. Address-based lookups (`GetModuleHandleEx(FROM_ADDRESS)`) miss it. But who even does that? |
+| CFG target registration | Needs `GuardCFFunctionTable` parsing plus `SetProcessValidCallTargets`; a no-op unless the process is CFG-enabled, and the payload's own CFG call sites already ran through `_guard_dispatch_icall` at build time. |
+| IAT commit-touch | Only matters for `SEC_IMAGE` views the loader did not create; Homer copies raw sections and writes them while already writable. |
+| Activation contexts | A mapped image has no SxS context; faking one is worse than omitting it. |
+| DLL notifications | `LdrpSendPostSnapNotifications` walks an internal list that cannot be synthesised from usermode. |
+| Trigger an ETW event | Why would it? |
+
+## But…
+
+A payload that calls `GetModuleHandle(NULL)` or walks `InLoadOrderModuleList` will not see itself. Code that needs to find its own base must use `RIP`-relative arithmetic or an explicit base pointer.
+
+A payload that registers TLS callbacks gets them once per load, on the loading thread only. Per-thread TLS for threads created later is not replicated.
+
+A payload that re-resolves its delay imports via the CRT helper sees them already bound (Homer binds them), which is a behavioural difference but not a failure.
+
+You can get a DLL into memory with a lot less work than Windows does. That is not the hard part. The hard part is making the rest of the system agree that the DLL is there.
+
+
+Have fun with this!
+Educational purposes only. Do no evil.
+TWILIGHT
